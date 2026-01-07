@@ -17,7 +17,6 @@ class SoldListing:
     shipping_price: Optional[float]
     sold_date: Optional[datetime]
     listing_url: str
-    seller: Optional[str]
     scraped_at: datetime
 
     def to_dict(self) -> dict:
@@ -29,7 +28,6 @@ class SoldListing:
             "shipping_price": self.shipping_price,
             "sold_date": self.sold_date.isoformat() if self.sold_date else None,
             "listing_url": self.listing_url,
-            "seller": self.seller,
             "scraped_at": self.scraped_at.isoformat(),
         }
 
@@ -173,7 +171,6 @@ class EbayParser:
 
         # Get shipping from attribute rows
         shipping_price = None
-        seller = None
 
         attr_rows = item.select(".s-card__attribute-row")
         for row in attr_rows:
@@ -183,13 +180,6 @@ class EbayParser:
             if "delivery" in row_text.lower() or "shipping" in row_text.lower():
                 shipping_price = self._parse_shipping(row_text)
 
-            # Check for seller info (contains "positive" for feedback)
-            if "positive" in row_text.lower():
-                # Extract seller username (before the percentage)
-                match = re.match(r"([a-zA-Z0-9_-]+)\d+%", row_text)
-                if match:
-                    seller = match.group(1)
-
         return SoldListing(
             listing_id=str(listing_id),
             title=title,
@@ -197,7 +187,6 @@ class EbayParser:
             shipping_price=shipping_price,
             sold_date=sold_date,
             listing_url=url,
-            seller=seller,
             scraped_at=scraped_at,
         )
 

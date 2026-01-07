@@ -1,4 +1,4 @@
-"""HTTP client for making requests to eBay."""
+"""HTTP client for making requests to eBay with anti-detection measures."""
 
 import httpx
 import random
@@ -18,138 +18,154 @@ class ChallengePageError(Exception):
     pass
 
 
+# Rotate through different User-Agents
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0",
+]
+
+
 class EbayClient:
     """HTTP client for fetching eBay sold listings pages."""
 
     BASE_URL = "https://www.ebay.com/sch/i.html"
 
-    # More complete headers to better mimic a real browser
-    DEFAULT_HEADERS = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
-        "Accept": (
-            "text/html,application/xhtml+xml,application/xml;q=0.9,"
-            "image/avif,image/webp,image/apng,*/*;q=0.8,"
-            "application/signed-exchange;v=b3;q=0.7"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br, zstd",
-        "Connection": "keep-alive",
-        "Cache-Control": "max-age=0",
-        "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"macOS"',
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
-        "DNT": "1",
-    }
-
     def __init__(
         self,
-        rate_limiter: Optional[RateLimiter] = None,
-        timeout: float = 30.0,
-        max_retries: int = 3,
+        requests_per_minute: float = 6.0,  # ~10 seconds between requests
+        max_retries: int = 5,
+        timeout: float = 45.0,
     ):
-        self.rate_limiter = rate_limiter or RateLimiter()
-        self.timeout = timeout
+        self.rate_limiter = RateLimiter(
+            requests_per_second=requests_per_minute / 60.0,
+            burst_size=1,
+        )
         self.max_retries = max_retries
+        self.timeout = timeout
         self._client: Optional[httpx.Client] = None
+        self._request_count = 0
+
+    def _get_headers(self) -> dict:
+        """Get randomized headers for each request."""
+        user_agent = random.choice(USER_AGENTS)
+
+        headers = {
+            "User-Agent": user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"macOS"' if "Mac" in user_agent else '"Windows"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+        }
+        return headers
 
     def _get_client(self) -> httpx.Client:
-        """Get or create the HTTP client."""
-        if self._client is None:
+        """Get or create the HTTP client with fresh headers."""
+        if self._client is None or self._request_count >= 5:
+            # Recreate client periodically to refresh session
+            if self._client is not None:
+                self._client.close()
             self._client = httpx.Client(
-                headers=self.DEFAULT_HEADERS,
                 timeout=self.timeout,
                 follow_redirects=True,
-                cookies=httpx.Cookies(),
             )
+            self._request_count = 0
         return self._client
 
     def _is_challenge_page(self, html: str, url: str) -> bool:
         """Check if the response is a challenge/captcha page."""
-        return (
-            "splashui/challenge" in url or
-            "captcha" in html.lower() or
-            "blocked" in html.lower() or
-            len(html) < 5000 and "s-card" not in html
-        )
+        indicators = [
+            "splashui/challenge" in url,
+            "pardon our interruption" in html.lower(),
+            "captcha" in html.lower(),
+            len(html) < 10000 and "s-card" not in html and "srp-results" not in html,
+        ]
+        return any(indicators)
+
+    def _random_delay(self, base: float = 3.0, variance: float = 5.0) -> None:
+        """Add a random delay to appear more human-like."""
+        delay = base + random.uniform(0, variance)
+        logger.debug(f"Waiting {delay:.1f}s...")
+        time.sleep(delay)
 
     def build_sold_listings_url(
         self,
         query: str,
         page: int = 1,
-        items_per_page: int = 240,
+        items_per_page: int = 120,  # Use 120 instead of 240 to be less aggressive
     ) -> str:
-        """Build URL for eBay sold listings search.
-
-        Args:
-            query: Search query string
-            page: Page number (1-indexed)
-            items_per_page: Number of items per page (60, 120, or 240)
-
-        Returns:
-            Full URL for the eBay search
-        """
+        """Build URL for eBay sold listings search."""
         params = {
             "_nkw": query,
-            "_sacat": "0",  # All categories
-            "LH_Sold": "1",  # Sold listings only
-            "LH_Complete": "1",  # Completed listings
+            "_sacat": "0",
+            "LH_Sold": "1",
+            "LH_Complete": "1",
             "_ipg": str(items_per_page),
-            "_sop": "13",  # Sort by date: most recent first
+            "_sop": "13",
+            "rt": "nc",  # Add this to seem more like browser navigation
         }
 
-        # Add pagination offset
         if page > 1:
             params["_pgn"] = str(page)
 
         return f"{self.BASE_URL}?{urlencode(params)}"
 
-    def fetch_page(self, url: str) -> str:
-        """Fetch a single page from eBay with retry logic.
-
-        Args:
-            url: URL to fetch
-
-        Returns:
-            HTML content of the page
-
-        Raises:
-            httpx.HTTPError: If the request fails after retries
-            ChallengePageError: If eBay keeps returning challenge pages
-        """
+    def fetch_page(self, url: str, is_retry: bool = False) -> str:
+        """Fetch a single page from eBay with retry logic."""
         last_error = None
 
         for attempt in range(self.max_retries):
+            # Wait for rate limiter
             self.rate_limiter.acquire_sync()
 
-            # Add random delay between requests to appear more human-like
-            if attempt > 0:
-                delay = random.uniform(2.0, 5.0) * (attempt + 1)
-                logger.info(f"Retry {attempt + 1}/{self.max_retries}, waiting {delay:.1f}s...")
-                time.sleep(delay)
+            # Add random delay (longer for retries)
+            if attempt > 0 or is_retry:
+                base_delay = 5.0 + (attempt * 3.0)
+                self._random_delay(base=base_delay, variance=8.0)
+            else:
+                self._random_delay(base=2.0, variance=4.0)
 
             try:
                 client = self._get_client()
-                response = client.get(url)
-                response.raise_for_status()
+                headers = self._get_headers()
 
+                # Add referer on retries to look more natural
+                if attempt > 0:
+                    headers["Referer"] = "https://www.ebay.com/"
+
+                response = client.get(url, headers=headers)
+                self._request_count += 1
+
+                # Handle rate limiting responses
+                if response.status_code == 429:
+                    logger.warning(f"Rate limited (429), waiting longer...")
+                    time.sleep(30 + random.uniform(0, 30))
+                    continue
+
+                response.raise_for_status()
                 html = response.text
                 final_url = str(response.url)
 
-                # Check if we got a challenge page
+                # Check for challenge page
                 if self._is_challenge_page(html, final_url):
-                    logger.warning(f"Got challenge page on attempt {attempt + 1}")
-                    # Close and recreate client to get fresh session
+                    logger.warning(f"Challenge page detected on attempt {attempt + 1}")
+                    # Reset client to get new session
                     self.close()
                     last_error = ChallengePageError("eBay returned a challenge page")
+                    # Longer backoff for challenge pages
+                    time.sleep(15 + random.uniform(0, 15))
                     continue
 
                 return html
@@ -159,7 +175,6 @@ class EbayClient:
                 last_error = e
                 continue
 
-        # All retries failed
         if last_error:
             raise last_error
         raise ChallengePageError("Failed to fetch page after all retries")
@@ -168,26 +183,19 @@ class EbayClient:
         self,
         query: str,
         page: int = 1,
-        items_per_page: int = 240,
+        items_per_page: int = 120,
     ) -> str:
-        """Fetch sold listings search results from eBay.
-
-        Args:
-            query: Search query string
-            page: Page number (1-indexed)
-            items_per_page: Number of items per page
-
-        Returns:
-            HTML content of the search results page
-        """
+        """Fetch sold listings search results from eBay."""
         url = self.build_sold_listings_url(query, page, items_per_page)
-        return self.fetch_page(url)
+        is_retry = page > 1  # Be more careful on subsequent pages
+        return self.fetch_page(url, is_retry=is_retry)
 
     def close(self) -> None:
         """Close the HTTP client."""
         if self._client is not None:
             self._client.close()
             self._client = None
+            self._request_count = 0
 
     def __enter__(self) -> "EbayClient":
         return self

@@ -7,9 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .ebay_client import EbayClient
+from .ebay_client import EbayClient, ChallengePageError
 from .parser import EbayParser, SoldListing
-from .rate_limiter import RateLimiter
 
 
 logging.basicConfig(
@@ -45,20 +44,19 @@ class SoldListingsScraper:
 
     def __init__(
         self,
-        requests_per_second: float = 0.5,
-        burst_size: int = 3,
+        requests_per_minute: float = 4.0,  # Conservative: ~15 seconds between requests
+        max_retries: int = 5,
     ):
         """Initialize the scraper.
 
         Args:
-            requests_per_second: Rate limit for requests
-            burst_size: Maximum burst of requests allowed
+            requests_per_minute: Rate limit (default ~15s between requests)
+            max_retries: Maximum retry attempts per page
         """
-        self.rate_limiter = RateLimiter(
-            requests_per_second=requests_per_second,
-            burst_size=burst_size,
+        self.client = EbayClient(
+            requests_per_minute=requests_per_minute,
+            max_retries=max_retries,
         )
-        self.client = EbayClient(rate_limiter=self.rate_limiter)
         self.parser = EbayParser()
 
     def scrape(
@@ -117,9 +115,13 @@ class SoldListingsScraper:
                     logger.info("No more pages available")
                     break
 
+            except ChallengePageError as e:
+                logger.warning(f"Challenge page on page {page}, stopping to avoid detection")
+                break
             except Exception as e:
                 logger.error(f"Error scraping page {page}: {e}")
-                break
+                # Continue to next page instead of breaking immediately
+                continue
 
         logger.info(
             f"Scrape complete: {len(all_listings)} listings from {pages_scraped} pages"
